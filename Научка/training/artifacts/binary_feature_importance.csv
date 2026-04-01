@@ -1,0 +1,16 @@
+feature,importance
+global_tx_count_prev_5m,30.28447116662985
+client_tx_count_prev_5m,16.438225348829675
+amount,16.113313329460997
+amount_to_client_mean_ratio,12.43184654416408
+log_amount,7.9793453448683564
+client_amount_mean_past,7.098305214385941
+prev_amount_client,4.560093000924892
+beneficiary_bic,2.682768376692739
+is_new_pair,1.7414738770840954
+secs_since_prev_client_tx,0.6701577969593934
+day_of_week,0.0
+payer_bic,0.0
+payer_client_id,0.0
+is_weekend,0.0
+trn_type,0.0

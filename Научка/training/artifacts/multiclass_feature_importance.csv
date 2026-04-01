@@ -1,0 +1,14 @@
+feature,importance
+client_amount_mean_past,21.824187392876667
+global_tx_count_prev_5m,19.181639428363848
+amount,13.916840046576086
+log_amount,12.624542240355552
+client_tx_count_prev_5m,11.364552812955095
+amount_to_client_mean_ratio,5.706135520411813
+prev_amount_client,5.058203638757572
+payer_client_id,3.691227368783051
+beneficiary_bic,3.200822883087502
+secs_since_prev_client_tx,2.4664347357317262
+is_new_pair,0.6903793213566374
+payer_bic,0.2750346107440959
+trn_type,0.0
