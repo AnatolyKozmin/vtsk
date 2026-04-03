@@ -140,6 +140,62 @@ async def api_ml_events():
     return events
 
 
+@app.get("/api/model-quality")
+async def api_model_quality():
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT
+                COUNT(*)                                                                AS total,
+
+                COUNT(*) FILTER (WHERE tr.is_malicious = true)                          AS real_malicious,
+                COUNT(*) FILTER (WHERE tr.is_malicious = false)                         AS real_normal,
+
+                -- ML layer
+                COUNT(*) FILTER (WHERE r.blocked_by = 'ml_proxy')                      AS ml_blocked,
+                COUNT(*) FILTER (WHERE r.blocked_by = 'ml_proxy'
+                                   AND tr.is_malicious = true)                          AS ml_tp,
+                COUNT(*) FILTER (WHERE r.blocked_by = 'ml_proxy'
+                                   AND tr.is_malicious = false)                         AS ml_fp,
+                COUNT(*) FILTER (WHERE (r.blocked_by IS NULL OR r.blocked_by != 'ml_proxy')
+                                   AND tr.is_malicious = true)                          AS ml_fn
+
+            FROM traffic_responses r
+            LEFT JOIN traffic_requests tr ON r.request_id = tr.request_id
+        """)
+
+    total          = row["total"]          or 0
+    real_mal       = row["real_malicious"] or 0
+    real_norm      = row["real_normal"]    or 0
+    ml_blocked     = row["ml_blocked"]     or 0
+    tp             = row["ml_tp"]          or 0
+    fp             = row["ml_fp"]          or 0
+    fn             = row["ml_fn"]          or 0
+    tn             = max(0, real_norm - fp)
+
+    detection_rate = round(tp / real_mal * 100,  1) if real_mal  > 0 else None
+    fp_rate        = round(fp / real_norm * 100, 1) if real_norm > 0 else None
+    precision      = round(tp / ml_blocked * 100, 1) if ml_blocked > 0 else None
+    f1 = None
+    if precision is not None and detection_rate is not None:
+        p = precision / 100
+        r = detection_rate / 100
+        f1 = round(2 * p * r / (p + r) * 100, 1) if (p + r) > 0 else 0.0
+
+    return {
+        "total":          total,
+        "real_malicious": real_mal,
+        "real_normal":    real_norm,
+        "ml_blocked":     ml_blocked,
+        "tp": tp, "fp": fp, "fn": fn, "tn": tn,
+        "detection_rate_pct":    detection_rate,
+        "false_positive_rate_pct": fp_rate,
+        "precision_pct":  precision,
+        "f1_pct":         f1,
+        "has_data":       total > 0 and (real_mal + real_norm) > 0,
+    }
+
+
 @app.get("/api/waf-events")
 async def api_waf_events():
     pool = await get_pool()
@@ -347,9 +403,82 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
     .no-data { padding: 32px; text-align: center; color: var(--muted); font-size: 13px; }
 
+    /* ---- quality section ---- */
+    .quality-section {
+      margin: 20px 28px 0;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 20px 24px;
+    }
+    .quality-nodata {
+      color: var(--muted); font-size: 13px; padding: 12px 0;
+    }
+    .quality-nodata code {
+      background: rgba(255,255,255,.06); padding: 2px 6px; border-radius: 4px;
+      font-size: 12px; color: var(--blue);
+    }
+    .quality-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 14px;
+    }
+    .q-card {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+    }
+    .q-card.green  { border-top: 2px solid var(--green);  }
+    .q-card.blue   { border-top: 2px solid var(--blue);   }
+    .q-card.orange { border-top: 2px solid var(--orange); }
+    .q-card.purple { border-top: 2px solid var(--purple); }
+    .q-label { font-size: 12px; font-weight: 600; color: var(--muted);
+               text-transform: uppercase; letter-spacing: .6px; }
+    .q-hint  { font-size: 11px; color: var(--muted); margin: 4px 0 10px;
+               line-height: 1.4; min-height: 30px; }
+    .q-value { font-size: 32px; font-weight: 700; margin-bottom: 10px; line-height: 1; }
+    .q-card.green  .q-value { color: var(--green);  }
+    .q-card.blue   .q-value { color: var(--blue);   }
+    .q-card.orange .q-value { color: var(--orange); }
+    .q-card.purple .q-value { color: var(--purple); }
+    .q-bar-wrap { background: rgba(255,255,255,.06); border-radius: 4px;
+                  height: 6px; overflow: hidden; margin-bottom: 8px; }
+    .q-bar      { height: 100%; border-radius: 4px; transition: width .4s ease; width: 0; }
+    .green-bar  { background: var(--green);  }
+    .blue-bar   { background: var(--blue);   }
+    .orange-bar { background: var(--orange); }
+    .purple-bar { background: var(--purple); }
+    .q-formula  { font-size: 11px; color: var(--muted); font-family: monospace; }
+
+    /* ---- confusion matrix ---- */
+    .cm-grid {
+      display: grid;
+      grid-template-columns: 140px 1fr 1fr;
+      gap: 6px;
+      max-width: 500px;
+    }
+    .cm-axis {
+      font-size: 11px; color: var(--muted); font-weight: 600;
+      display: flex; align-items: center; justify-content: center;
+      text-align: center; padding: 4px;
+    }
+    .cm-cell {
+      border-radius: 8px; padding: 16px 12px;
+      font-size: 22px; font-weight: 700;
+      text-align: center; position: relative;
+    }
+    .green-cell { background: rgba(63,185,80,.12);  color: var(--green);  border: 1px solid rgba(63,185,80,.25); }
+    .red-cell   { background: rgba(248,81,73,.10);  color: var(--red);    border: 1px solid rgba(248,81,73,.2); }
+    .cm-cell-label {
+      font-size: 10px; font-weight: 400; color: var(--muted);
+      margin-top: 4px; display: block;
+    }
+
     @media (max-width: 900px) {
       .stats-row { grid-template-columns: 1fr 1fr; }
       .feeds { grid-template-columns: 1fr; }
+      .quality-grid { grid-template-columns: 1fr 1fr; }
     }
   </style>
 </head>
@@ -389,6 +518,67 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="section-title">Трафик за последние 30 минут</div>
   <div class="chart-wrap">
     <canvas id="timeline-chart"></canvas>
+  </div>
+</div>
+
+<!-- Model quality -->
+<div class="quality-section">
+  <div class="section-title">Качество ML модели (по живым данным)</div>
+  <div id="no-quality-data" class="quality-nodata">
+    Недостаточно данных — нужны запросы с меткой <code>is_malicious</code> из sender
+  </div>
+  <div id="quality-grid" class="quality-grid" style="display:none">
+
+    <div class="q-card green">
+      <div class="q-label">Detection Rate</div>
+      <div class="q-hint">доля реальных атак, которые поймала модель</div>
+      <div class="q-value" id="q-dr">—</div>
+      <div class="q-bar-wrap"><div class="q-bar green-bar" id="q-dr-bar"></div></div>
+      <div class="q-formula">TP / (TP + FN)</div>
+    </div>
+
+    <div class="q-card blue">
+      <div class="q-label">Precision</div>
+      <div class="q-hint">доля блокировок, которые были правильными</div>
+      <div class="q-value" id="q-pr">—</div>
+      <div class="q-bar-wrap"><div class="q-bar blue-bar" id="q-pr-bar"></div></div>
+      <div class="q-formula">TP / (TP + FP)</div>
+    </div>
+
+    <div class="q-card orange">
+      <div class="q-label">False Positive Rate</div>
+      <div class="q-hint">доля нормальных запросов, заблокированных зря</div>
+      <div class="q-value" id="q-fpr">—</div>
+      <div class="q-bar-wrap"><div class="q-bar orange-bar" id="q-fpr-bar"></div></div>
+      <div class="q-formula">FP / (FP + TN)</div>
+    </div>
+
+    <div class="q-card purple">
+      <div class="q-label">F1 Score</div>
+      <div class="q-hint">баланс между detection rate и precision</div>
+      <div class="q-value" id="q-f1">—</div>
+      <div class="q-bar-wrap"><div class="q-bar purple-bar" id="q-f1-bar"></div></div>
+      <div class="q-formula">2 · Precision · Recall / (P + R)</div>
+    </div>
+
+  </div>
+
+  <!-- confusion matrix -->
+  <div id="cm-wrap" style="display:none;margin-top:16px;">
+    <div class="section-title" style="margin-bottom:10px">Confusion Matrix</div>
+    <div class="cm-grid">
+      <div></div>
+      <div class="cm-axis">Предсказано: норма</div>
+      <div class="cm-axis">Предсказано: атака</div>
+
+      <div class="cm-axis">Реально: норма</div>
+      <div class="cm-cell green-cell" id="cm-tn">—</div>
+      <div class="cm-cell red-cell"   id="cm-fp">—<div class="cm-cell-label">FP — ложная тревога</div></div>
+
+      <div class="cm-axis">Реально: атака</div>
+      <div class="cm-cell red-cell"   id="cm-fn">—<div class="cm-cell-label">FN — пропустили</div></div>
+      <div class="cm-cell green-cell" id="cm-tp">—</div>
+    </div>
   </div>
 </div>
 
@@ -547,6 +737,53 @@ async function updateMLEvents() {
   } catch(e) { console.error(e); }
 }
 
+async function updateModelQuality() {
+  try {
+    const d = await fetch('/api/model-quality').then(r => r.json());
+    const noData = document.getElementById('no-quality-data');
+    const grid   = document.getElementById('quality-grid');
+    const cmWrap = document.getElementById('cm-wrap');
+
+    if (!d.has_data) {
+      noData.style.display = 'block';
+      grid.style.display   = 'none';
+      cmWrap.style.display = 'none';
+      return;
+    }
+
+    noData.style.display = 'none';
+    grid.style.display   = 'grid';
+    cmWrap.style.display = 'block';
+
+    function setMetric(id, barId, val, invert) {
+      const el  = document.getElementById(id);
+      const bar = document.getElementById(barId);
+      if (val === null || val === undefined) {
+        el.textContent = '—';
+        bar.style.width = '0%';
+        return;
+      }
+      el.textContent = val + ' %';
+      bar.style.width = Math.min(val, 100) + '%';
+      // colour coding
+      let good, bad;
+      if (invert) { good = val < 5; bad = val > 15; }
+      else         { good = val > 80; bad = val < 50; }
+      el.style.opacity = bad ? '.6' : '1';
+    }
+
+    setMetric('q-dr',  'q-dr-bar',  d.detection_rate_pct,      false);
+    setMetric('q-pr',  'q-pr-bar',  d.precision_pct,           false);
+    setMetric('q-fpr', 'q-fpr-bar', d.false_positive_rate_pct, true);
+    setMetric('q-f1',  'q-f1-bar',  d.f1_pct,                  false);
+
+    document.getElementById('cm-tn').childNodes[0].textContent = fmt(d.tn);
+    document.getElementById('cm-fp').childNodes[0].textContent = fmt(d.fp);
+    document.getElementById('cm-fn').childNodes[0].textContent = fmt(d.fn);
+    document.getElementById('cm-tp').childNodes[0].textContent = fmt(d.tp);
+  } catch(e) { console.error(e); }
+}
+
 async function updateWAFEvents() {
   try {
     const rows = await fetch('/api/waf-events').then(r => r.json());
@@ -572,13 +809,14 @@ function tick() {
   updateWAFEvents();
 }
 
-// timeline refreshes a bit less often
-setInterval(updateTimeline, 5000);
+setInterval(updateTimeline,     5000);
+setInterval(updateModelQuality, 8000);
 setInterval(tick, 2000);
 
 // initial load
 tick();
 updateTimeline();
+updateModelQuality();
 </script>
 
 </body>
