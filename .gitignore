@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+ENV/
+.venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Database
+*.sqlite3
+*.db
+
+# Docker volumes (never commit postgres data)
+pg_data/
+
+# ML artifacts — большие файлы, не коммитим
+Научка/data/
+Научка/training/models/*.cbm
+Web-service/model-api/models/
+
+# CatBoost training logs (regenerated on each run)
+catboost_info/
+Научка/catboost_info/
+Научка/training/catboost_info/
+
+# Generated transaction data
+generated_transactions/
+data/transactions/
+
+# Misc
+*.bak
+*.swp
+*~
+.kiro/

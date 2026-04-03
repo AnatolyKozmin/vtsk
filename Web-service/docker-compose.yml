@@ -1,0 +1,198 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ws-postgres
+    environment:
+      POSTGRES_USER: ${DB_USER:-vtsk}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-1234}
+      POSTGRES_DB: ${DB_NAME:-vtsk_db}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-vtsk} -d ${DB_NAME:-vtsk_db}"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    networks:
+      - db_net
+
+  pfsense-a:
+    image: alpine/socat:1.8.0.0
+    container_name: ws-pfsense-a
+    command:
+      - -d
+      - -d
+      - TCP-LISTEN:5001,reuseaddr,fork
+      - TCP:model-api:5001
+    depends_on:
+      model-api:
+        condition: service_healthy
+    networks:
+      - contour_a
+      - transit_net
+
+  # ── ML inspection layer ─────────────────────────────────────────────────
+  # Sits between the two pfsense firewalls in transit_net.
+  # Scores each request with CatBoost (behavioural anomaly detection).
+  # Anomalous requests are dropped; the clean batch is forwarded to pfsense-b.
+  # Also writes block events to postgres so the monitor can display them.
+  model-api:
+    build:
+      context: ./model-api
+      dockerfile: Dockerfile
+    container_name: ws-model-api
+    environment:
+      MODELS_DIR: /models
+      DOWNSTREAM_URL: http://pfsense-b:5001
+      BINARY_THRESHOLD: ${BINARY_THRESHOLD:-0.5}
+      DB_USER: ${DB_USER:-vtsk}
+      DB_PASSWORD: ${DB_PASSWORD:-1234}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-vtsk_db}
+    volumes:
+      # trained .cbm files — run Научка/training/train_*.py first
+      - ../Научка/training/models:/models:ro
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:5001/health').read()\""]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pfsense-b:
+        condition: service_started
+    networks:
+      - transit_net
+      - db_net
+  # ────────────────────────────────────────────────────────────────────────
+
+  # ── Live traffic monitor dashboard ──────────────────────────────────────
+  # Open http://localhost:8080 to see real-time ML + WAF blocking stats.
+  monitor:
+    build: .
+    container_name: ws-monitor
+    command: python -m uvicorn app.monitor_app:app --host 0.0.0.0 --port 8080
+    environment:
+      DB_USER: ${DB_USER:-vtsk}
+      DB_PASSWORD: ${DB_PASSWORD:-1234}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-vtsk_db}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    networks:
+      - db_net
+  # ────────────────────────────────────────────────────────────────────────
+
+  pfsense-b:
+    image: alpine/socat:1.8.0.0
+    container_name: ws-pfsense-b
+    command:
+      - -d
+      - -d
+      - TCP-LISTEN:5001,reuseaddr,fork
+      - TCP:receiver:5001
+    depends_on:
+      receiver:
+        condition: service_started
+    networks:
+      - transit_net
+      - contour_b
+
+  sender:
+    build: .
+    container_name: ws-sender
+    command: python -m uvicorn app.sender:app --host 0.0.0.0 --port 5000
+    environment:
+      DB_USER: ${DB_USER:-vtsk}
+      DB_PASSWORD: ${DB_PASSWORD:-1234}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-vtsk_db}
+      SENDER_PORT: 5000
+      RECEIVER_URL: http://pfsense-a:5001
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pfsense-a:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/').read()\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "5000:5000"
+    networks:
+      - contour_a
+      - db_net
+
+  receiver:
+    build: .
+    container_name: ws-receiver
+    command: python -m uvicorn app.receiver:app --host 0.0.0.0 --port 5001
+    environment:
+      DB_USER: ${DB_USER:-vtsk}
+      DB_PASSWORD: ${DB_PASSWORD:-1234}
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${DB_NAME:-vtsk_db}
+      RECEIVER_PORT: 5001
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:5001/health').read()\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      - contour_b
+      - db_net
+
+  traffic-generator:
+    image: curlimages/curl:8.8.0
+    container_name: ws-traffic-generator
+    command:
+      - sh
+      - -ec
+      - |
+        TARGET_TOTAL=100000;
+        CHUNK=300;
+        sent=0;
+        echo "Synthetic traffic generator started. Target=$${TARGET_TOTAL}";
+        sleep 10;
+        while [ "$$sent" -lt "$$TARGET_TOTAL" ]; do
+          remaining=$$((TARGET_TOTAL - sent));
+          batch=$$CHUNK;
+          if [ "$$remaining" -lt "$$CHUNK" ]; then
+            batch=$$remaining;
+          fi;
+          curl -s -X POST "http://sender:5000/start?mode=mixed&total_requests=$${batch}&requests_per_second=80&malicious_ratio=0.2&attack_types=sql_injection,xss,path_traversal,cmd_injection" > /dev/null || true;
+          sent=$((sent + batch));
+          echo "Submitted $${sent}/$${TARGET_TOTAL}";
+          sleep 12;
+        done;
+        echo "Generation finished: $${sent}/$${TARGET_TOTAL}";
+    depends_on:
+      sender:
+        condition: service_healthy
+    networks:
+      - contour_a
+
+volumes:
+  pg_data:
+
+networks:
+  contour_a:
+    internal: true
+  contour_b:
+    internal: true
+  transit_net:
+    internal: true
+  db_net:
