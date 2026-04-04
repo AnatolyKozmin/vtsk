@@ -81,19 +81,28 @@ async def lifespan(app: FastAPI):
     binary_path = MODELS_DIR / "binary_model.cbm"
     multiclass_path = MODELS_DIR / "multiclass_model.cbm"
 
-    if not binary_path.exists():
-        raise FileNotFoundError(f"Binary model not found: {binary_path}")
-    if not multiclass_path.exists():
-        raise FileNotFoundError(f"Multiclass model not found: {multiclass_path}")
-
-    binary_model = CatBoostClassifier()
-    binary_model.load_model(str(binary_path))
-
-    multiclass_model = CatBoostClassifier()
-    multiclass_model.load_model(str(multiclass_path))
+    if binary_path.exists() and multiclass_path.exists():
+        try:
+            binary_model = CatBoostClassifier()
+            binary_model.load_model(str(binary_path))
+            multiclass_model = CatBoostClassifier()
+            multiclass_model.load_model(str(multiclass_path))
+            logger.info("Models loaded OK. Downstream: %s | Threshold: %.2f",
+                        DOWNSTREAM_URL, BINARY_THRESHOLD)
+        except Exception as exc:
+            logger.error("Failed to load models: %s — running in PASS-THROUGH mode", exc)
+            binary_model = None
+            multiclass_model = None
+    else:
+        logger.warning(
+            "Model files not found in %s — running in PASS-THROUGH mode "
+            "(all traffic forwarded, no ML scoring). "
+            "Train models first: cd Научка && python training/train_binary.py && "
+            "python training/train_multiclass.py",
+            MODELS_DIR,
+        )
 
     await init_pool()
-    logger.info("Models loaded. Downstream: %s | Threshold: %.2f", DOWNSTREAM_URL, BINARY_THRESHOLD)
     yield
     await close_pool()
 
@@ -167,6 +176,7 @@ async def health() -> dict:
     return {
         "status": "ok",
         "models_loaded": binary_model is not None and multiclass_model is not None,
+        "mode": "ml_proxy" if binary_model is not None else "pass_through",
         "downstream": DOWNSTREAM_URL,
         "threshold": BINARY_THRESHOLD,
     }
@@ -195,6 +205,10 @@ async def receive(request: Request) -> Response:
     blocked_results = []
 
     for req in requests_list:
+        # pass-through if models aren't loaded
+        if binary_model is None:
+            clean_requests.append(req)
+            continue
         try:
             decision = await _score_request(req)
         except (ValueError, KeyError) as exc:

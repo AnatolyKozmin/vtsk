@@ -54,6 +54,35 @@ app = FastAPI(title="ML Traffic Monitor", lifespan=lifespan)
 # API endpoints
 # ---------------------------------------------------------------------------
 
+@app.get("/api/debug")
+async def api_debug():
+    """Diagnostic endpoint — shows row counts for all key tables."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        tables = ["traffic_requests", "traffic_responses",
+                  "protection_events", "blocked_requests", "test_sessions"]
+        counts = {}
+        for t in tables:
+            try:
+                row = await conn.fetchrow(f"SELECT COUNT(*) AS n FROM {t}")
+                counts[t] = row["n"]
+            except Exception as exc:
+                counts[t] = f"ERROR: {exc}"
+
+        # joinable rows (both tables have same request_id)
+        try:
+            j = await conn.fetchrow("""
+                SELECT COUNT(*) AS n
+                FROM traffic_responses r
+                INNER JOIN traffic_requests tr ON r.request_id = tr.request_id
+            """)
+            counts["_joinable_rows"] = j["n"]
+        except Exception as exc:
+            counts["_joinable_rows"] = f"ERROR: {exc}"
+
+    return counts
+
+
 @app.get("/api/stats")
 async def api_stats():
     pool = await get_pool()
@@ -64,24 +93,31 @@ async def api_stats():
                 COUNT(*) FILTER (WHERE NOT was_blocked)                           AS passed,
                 COUNT(*) FILTER (WHERE was_blocked AND blocked_by = 'ml_proxy')   AS ml_blocked,
                 COUNT(*) FILTER (WHERE was_blocked AND blocked_by != 'ml_proxy')  AS waf_blocked,
-                ROUND(AVG(response_time_ms)::numeric, 2)                          AS avg_latency_ms
+                ROUND(AVG(response_time_ms)::numeric, 2)                          AS avg_latency_ms,
+                COUNT(*) FILTER (WHERE received_at >= NOW() - INTERVAL '60 seconds') AS last_60s
             FROM traffic_responses
         """)
-        total     = row["total"]     or 0
-        passed    = row["passed"]    or 0
-        ml_blk    = row["ml_blocked"]  or 0
-        waf_blk   = row["waf_blocked"] or 0
-        avg_lat   = float(row["avg_latency_ms"] or 0)
+        sent_row = await conn.fetchrow("SELECT COUNT(*) AS n FROM traffic_requests")
+
+        total   = row["total"]      or 0
+        passed  = row["passed"]     or 0
+        ml_blk  = row["ml_blocked"] or 0
+        waf_blk = row["waf_blocked"] or 0
+        avg_lat = float(row["avg_latency_ms"] or 0)
+        last60  = row["last_60s"]   or 0
+        sent    = sent_row["n"]     or 0
 
     return {
-        "total":       total,
-        "passed":      passed,
-        "ml_blocked":  ml_blk,
-        "waf_blocked": waf_blk,
+        "total":          total,
+        "sent":           sent,
+        "passed":         passed,
+        "ml_blocked":     ml_blk,
+        "waf_blocked":    waf_blk,
         "avg_latency_ms": avg_lat,
-        "pass_pct":    round(passed    / total * 100, 1) if total else 0,
-        "ml_pct":      round(ml_blk    / total * 100, 1) if total else 0,
-        "waf_pct":     round(waf_blk   / total * 100, 1) if total else 0,
+        "rps":            round(last60 / 60, 1),
+        "pass_pct":  round(passed  / total * 100, 1) if total else 0,
+        "ml_pct":    round(ml_blk  / total * 100, 1) if total else 0,
+        "waf_pct":   round(waf_blk / total * 100, 1) if total else 0,
     }
 
 
@@ -308,17 +344,51 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     header {
       background: var(--surface);
       border-bottom: 1px solid var(--border);
-      padding: 16px 28px;
+      padding: 14px 28px;
       display: flex;
       align-items: center;
-      justify-content: space-between;
+      gap: 32px;
     }
     header h1 {
       font-size: 18px;
       font-weight: 600;
       letter-spacing: .5px;
+      white-space: nowrap;
     }
     header h1 span { color: var(--blue); }
+    .header-counter {
+      display: flex;
+      align-items: baseline;
+      gap: 8px;
+    }
+    .header-counter-value {
+      font-size: 28px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      color: var(--blue);
+      letter-spacing: -0.5px;
+      transition: color .3s;
+    }
+    .header-counter-value.ticked { color: var(--green); }
+    .header-counter-label {
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.3;
+    }
+    .header-right {
+      margin-left: auto;
+      display: flex;
+      align-items: center;
+      gap: 20px;
+    }
+    .header-rps {
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .header-rps span {
+      color: var(--green);
+      font-weight: 600;
+    }
     #last-updated { font-size: 12px; color: var(--muted); }
     .dot {
       display: inline-block; width: 8px; height: 8px;
@@ -490,6 +560,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       background: rgba(255,255,255,.06); padding: 2px 6px; border-radius: 4px;
       font-size: 12px; color: var(--blue);
     }
+    .diag-row {
+      display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px;
+    }
+    .diag-pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      background: var(--bg); border: 1px solid var(--border);
+      border-radius: 20px; padding: 4px 12px; font-size: 12px;
+    }
+    .diag-pill .diag-label { color: var(--muted); }
+    .diag-pill .diag-count { font-weight: 700; }
+    .diag-pill.ok   .diag-count { color: var(--green);  }
+    .diag-pill.warn .diag-count { color: var(--orange); }
+    .diag-pill.bad  .diag-count { color: var(--red);    }
+    .diag-hint {
+      margin-top: 10px; font-size: 12px; color: var(--orange);
+      background: rgba(210,153,34,.08); border: 1px solid rgba(210,153,34,.2);
+      border-radius: 6px; padding: 8px 12px; line-height: 1.6;
+    }
+    .diag-hint code {
+      background: rgba(255,255,255,.06); padding: 1px 5px;
+      border-radius: 3px; font-size: 11px; color: var(--blue);
+    }
     .quality-grid {
       display: grid;
       grid-template-columns: repeat(4, 1fr);
@@ -561,7 +653,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <header>
   <h1><span class="dot"></span>ML Traffic <span>Monitor</span></h1>
-  <span id="last-updated">—</span>
+
+  <div class="header-counter">
+    <div class="header-counter-value" id="hdr-total">—</div>
+    <div class="header-counter-label">всего<br>запросов</div>
+  </div>
+
+  <div class="header-counter">
+    <div class="header-counter-value" id="hdr-sent" style="color:var(--muted)">—</div>
+    <div class="header-counter-label">отправлено<br>sender'ом</div>
+  </div>
+
+  <div class="header-right">
+    <div class="header-rps">~<span id="hdr-rps">0</span> req/s</div>
+    <span id="last-updated">—</span>
+  </div>
 </header>
 
 <!-- Stats -->
@@ -630,10 +736,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <!-- Model quality -->
 <div class="quality-section">
   <div class="section-title">Качество ML модели (по живым данным)</div>
-  <div id="no-quality-data" class="quality-nodata">
-    Недостаточно данных — нужны запросы с меткой <code>is_malicious</code> из sender
-  </div>
-  <div id="quality-grid" class="quality-grid" style="display:none">
+
+  <!-- Diagnostic pills — всегда видны -->
+  <div class="diag-row" id="diag-row"></div>
+  <div id="diag-hint" class="diag-hint" style="display:none"></div>
+
+  <div id="quality-grid" class="quality-grid" style="margin-top:16px">
 
     <div class="q-card green">
       <div class="q-label">Detection Rate</div>
@@ -854,13 +962,28 @@ function attackTag(details) {
 }
 
 // ---- Data fetch ----
+let _prevTotal = 0;
+
 async function updateStats() {
   try {
     const d = await fetch('/api/stats').then(r => r.json());
-    document.getElementById('s-total').textContent   = fmt(d.total);
-    document.getElementById('s-passed').textContent  = fmt(d.passed);
-    document.getElementById('s-ml').textContent      = fmt(d.ml_blocked);
-    document.getElementById('s-waf').textContent     = fmt(d.waf_blocked);
+
+    // ---- header counters ----
+    const hdrTotal = document.getElementById('hdr-total');
+    if (d.total !== _prevTotal && _prevTotal > 0) {
+      hdrTotal.classList.add('ticked');
+      setTimeout(() => hdrTotal.classList.remove('ticked'), 600);
+    }
+    _prevTotal = d.total;
+    hdrTotal.textContent = d.total.toLocaleString('ru');
+    document.getElementById('hdr-sent').textContent = d.sent.toLocaleString('ru');
+    document.getElementById('hdr-rps').textContent  = d.rps;
+
+    // ---- stat cards ----
+    document.getElementById('s-total').textContent    = fmt(d.total);
+    document.getElementById('s-passed').textContent   = fmt(d.passed);
+    document.getElementById('s-ml').textContent       = fmt(d.ml_blocked);
+    document.getElementById('s-waf').textContent      = fmt(d.waf_blocked);
     document.getElementById('s-pass-pct').textContent = d.pass_pct + ' %';
     document.getElementById('s-ml-pct').textContent   = d.ml_pct  + ' %';
     document.getElementById('s-waf-pct').textContent  = d.waf_pct + ' %';
@@ -921,48 +1044,78 @@ async function updateMLEvents() {
 
 async function updateModelQuality() {
   try {
-    const d = await fetch('/api/model-quality').then(r => r.json());
-    const noData = document.getElementById('no-quality-data');
-    const grid   = document.getElementById('quality-grid');
-    const cmWrap = document.getElementById('cm-wrap');
+    const [d, dbg] = await Promise.all([
+      fetch('/api/model-quality').then(r => r.json()),
+      fetch('/api/debug').then(r => r.json()),
+    ]);
 
-    if (!d.has_data) {
-      noData.style.display = 'block';
-      grid.style.display   = 'none';
-      cmWrap.style.display = 'none';
-      return;
+    // ---- Diagnostic pills ----
+    const diagRow  = document.getElementById('diag-row');
+    const diagHint = document.getElementById('diag-hint');
+
+    const pills = [
+      { label: 'traffic_requests',  n: dbg.traffic_requests,  threshold: 1 },
+      { label: 'traffic_responses', n: dbg.traffic_responses, threshold: 1 },
+      { label: 'joinable rows',     n: dbg._joinable_rows,    threshold: 1 },
+      { label: 'protection_events', n: dbg.protection_events, threshold: 0 },
+    ];
+    diagRow.innerHTML = pills.map(p => {
+      const n   = typeof p.n === 'number' ? p.n : -1;
+      const cls = n > p.threshold ? 'ok' : n === 0 ? 'bad' : 'warn';
+      return `<div class="diag-pill ${cls}">
+        <span class="diag-label">${p.label}</span>
+        <span class="diag-count">${typeof p.n === 'number' ? fmt(p.n) : '?'}</span>
+      </div>`;
+    }).join('');
+
+    // Show hint if something is missing
+    const hints = [];
+    if ((dbg.traffic_requests  || 0) === 0)
+      hints.push('• <code>traffic_requests</code> пуста — пересобери контейнеры: <code>docker compose up --build</code>');
+    if ((dbg.traffic_responses || 0) === 0)
+      hints.push('• <code>traffic_responses</code> пуста — трафик не доходит до receiver. Проверь что model-api здоров.');
+    if ((dbg._joinable_rows    || 0) === 0 && (dbg.traffic_requests || 0) > 0)
+      hints.push('• Нет совпадающих request_id — sender и receiver пишут разные идентификаторы.');
+
+    if (hints.length) {
+      diagHint.style.display = 'block';
+      diagHint.innerHTML = hints.join('<br>');
+    } else {
+      diagHint.style.display = 'none';
     }
 
-    noData.style.display = 'none';
-    grid.style.display   = 'grid';
-    cmWrap.style.display = 'block';
+    // ---- Metric cards ----
+    const grid   = document.getElementById('quality-grid');
+    const cmWrap = document.getElementById('cm-wrap');
 
     function setMetric(id, barId, val, invert) {
       const el  = document.getElementById(id);
       const bar = document.getElementById(barId);
       if (val === null || val === undefined) {
         el.textContent = '—';
-        bar.style.width = '0%';
+        if (bar) bar.style.width = '0%';
         return;
       }
       el.textContent = val + ' %';
-      bar.style.width = Math.min(val, 100) + '%';
-      // colour coding
-      let good, bad;
-      if (invert) { good = val < 5; bad = val > 15; }
-      else         { good = val > 80; bad = val < 50; }
-      el.style.opacity = bad ? '.6' : '1';
+      if (bar) bar.style.width = Math.min(val, 100) + '%';
+      el.style.opacity = (invert ? val > 15 : val < 50) ? '.5' : '1';
     }
 
-    setMetric('q-dr',  'q-dr-bar',  d.detection_rate_pct,      false);
-    setMetric('q-pr',  'q-pr-bar',  d.precision_pct,           false);
-    setMetric('q-fpr', 'q-fpr-bar', d.false_positive_rate_pct, true);
-    setMetric('q-f1',  'q-f1-bar',  d.f1_pct,                  false);
-
-    document.getElementById('cm-tn').childNodes[0].textContent = fmt(d.tn);
-    document.getElementById('cm-fp').childNodes[0].textContent = fmt(d.fp);
-    document.getElementById('cm-fn').childNodes[0].textContent = fmt(d.fn);
-    document.getElementById('cm-tp').childNodes[0].textContent = fmt(d.tp);
+    if (d.has_data) {
+      grid.style.display   = 'grid';
+      cmWrap.style.display = 'block';
+      setMetric('q-dr',  'q-dr-bar',  d.detection_rate_pct,      false);
+      setMetric('q-pr',  'q-pr-bar',  d.precision_pct,           false);
+      setMetric('q-fpr', 'q-fpr-bar', d.false_positive_rate_pct, true);
+      setMetric('q-f1',  'q-f1-bar',  d.f1_pct,                  false);
+      document.getElementById('cm-tn').childNodes[0].textContent = fmt(d.tn);
+      document.getElementById('cm-fp').childNodes[0].textContent = fmt(d.fp);
+      document.getElementById('cm-fn').childNodes[0].textContent = fmt(d.fn);
+      document.getElementById('cm-tp').childNodes[0].textContent = fmt(d.tp);
+    } else {
+      grid.style.display   = 'none';
+      cmWrap.style.display = 'none';
+    }
   } catch(e) { console.error(e); }
 }
 

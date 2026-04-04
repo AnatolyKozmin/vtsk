@@ -162,14 +162,13 @@ services:
       - sh
       - -ec
       - |
-        BATCH=300;
-        total=0;
-        echo "Infinite traffic generator started (batch=$${BATCH})";
+        echo "Traffic generator started — running indefinitely";
         sleep 10;
+        i=1;
         while true; do
-          curl -s -X POST "http://sender:5000/start?mode=mixed&total_requests=$${BATCH}&requests_per_second=80&malicious_ratio=0.2&attack_types=sql_injection,xss,path_traversal,cmd_injection" > /dev/null || true;
-          total=$$((total + BATCH));
-          echo "Total submitted: $${total}";
+          curl -s -X POST "http://sender:5000/start?mode=mixed&total_requests=300&requests_per_second=80&malicious_ratio=0.2&attack_types=sql_injection,xss,path_traversal,cmd_injection" > /dev/null || true;
+          echo "Batch $${i} sent (300 req, 20% malicious)";
+          i=$$((i+1));
           sleep 15;
         done;
     depends_on:
