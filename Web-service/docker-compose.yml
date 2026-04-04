@@ -162,23 +162,16 @@ services:
       - sh
       - -ec
       - |
-        TARGET_TOTAL=100000;
-        CHUNK=300;
-        sent=0;
-        echo "Synthetic traffic generator started. Target=$${TARGET_TOTAL}";
+        BATCH=300;
+        total=0;
+        echo "Infinite traffic generator started (batch=$${BATCH})";
         sleep 10;
-        while [ "$$sent" -lt "$$TARGET_TOTAL" ]; do
-          remaining=$$((TARGET_TOTAL - sent));
-          batch=$$CHUNK;
-          if [ "$$remaining" -lt "$$CHUNK" ]; then
-            batch=$$remaining;
-          fi;
-          curl -s -X POST "http://sender:5000/start?mode=mixed&total_requests=$${batch}&requests_per_second=80&malicious_ratio=0.2&attack_types=sql_injection,xss,path_traversal,cmd_injection" > /dev/null || true;
-          sent=$((sent + batch));
-          echo "Submitted $${sent}/$${TARGET_TOTAL}";
-          sleep 12;
+        while true; do
+          curl -s -X POST "http://sender:5000/start?mode=mixed&total_requests=$${BATCH}&requests_per_second=80&malicious_ratio=0.2&attack_types=sql_injection,xss,path_traversal,cmd_injection" > /dev/null || true;
+          total=$$((total + BATCH));
+          echo "Total submitted: $${total}";
+          sleep 15;
         done;
-        echo "Generation finished: $${sent}/$${TARGET_TOTAL}";
     depends_on:
       sender:
         condition: service_healthy

@@ -196,6 +196,54 @@ async def api_model_quality():
     }
 
 
+@app.get("/api/quality-timeline")
+async def api_quality_timeline():
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT
+                to_char(date_trunc('minute', r.received_at), 'HH24:MI') AS minute,
+                SUM(CASE WHEN r.blocked_by = 'ml_proxy' AND tr.is_malicious = true  THEN 1 ELSE 0 END)::float AS tp,
+                SUM(CASE WHEN r.blocked_by = 'ml_proxy' AND tr.is_malicious = false THEN 1 ELSE 0 END)::float AS fp,
+                SUM(CASE WHEN (r.blocked_by IS NULL OR r.blocked_by != 'ml_proxy')
+                           AND tr.is_malicious = true  THEN 1 ELSE 0 END)::float AS fn,
+                SUM(CASE WHEN (r.blocked_by IS NULL OR r.blocked_by != 'ml_proxy')
+                           AND tr.is_malicious = false THEN 1 ELSE 0 END)::float AS tn
+            FROM traffic_responses r
+            INNER JOIN traffic_requests tr ON r.request_id = tr.request_id
+            WHERE r.received_at >= NOW() - INTERVAL '30 minutes'
+            GROUP BY date_trunc('minute', r.received_at)
+            ORDER BY date_trunc('minute', r.received_at)
+        """)
+
+    labels, dr_vals, pr_vals, f1_vals, fpr_vals = [], [], [], [], []
+
+    for r in rows:
+        tp, fp, fn, tn = r["tp"] or 0, r["fp"] or 0, r["fn"] or 0, r["tn"] or 0
+
+        dr  = round(tp / (tp + fn) * 100, 1) if (tp + fn) > 0 else None
+        pr  = round(tp / (tp + fp) * 100, 1) if (tp + fp) > 0 else None
+        fpr = round(fp / (fp + tn) * 100, 1) if (fp + tn) > 0 else None
+        f1  = None
+        if dr is not None and pr is not None and (dr + pr) > 0:
+            f1 = round(2 * (pr/100) * (dr/100) / ((pr + dr) / 100) * 100, 1)
+
+        labels.append(r["minute"])
+        dr_vals.append(dr)
+        pr_vals.append(pr)
+        f1_vals.append(f1)
+        fpr_vals.append(fpr)
+
+    return {
+        "labels":    labels,
+        "dr":        dr_vals,
+        "precision": pr_vals,
+        "f1":        f1_vals,
+        "fpr":       fpr_vals,
+        "has_data":  len(labels) > 0,
+    }
+
+
 @app.get("/api/waf-events")
 async def api_waf_events():
     pool = await get_pool()
@@ -313,9 +361,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     .stat-pct { font-size: 13px; color: var(--muted); }
     .stat-sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
 
-    /* ---- chart ---- */
-    .chart-section {
+    /* ---- charts row ---- */
+    .charts-row {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
       margin: 20px 28px 0;
+    }
+    .chart-section {
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: 10px;
@@ -328,8 +381,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       text-transform: uppercase;
       letter-spacing: .8px;
       margin-bottom: 16px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
     }
-    .chart-wrap { height: 200px; }
+    .section-title .legend {
+      display: flex; gap: 12px; margin-left: auto; font-weight: 400;
+      text-transform: none; letter-spacing: 0;
+    }
+    .legend-dot {
+      display: inline-flex; align-items: center; gap: 5px;
+      font-size: 11px; color: var(--muted);
+    }
+    .legend-dot::before {
+      content: ''; display: inline-block;
+      width: 20px; height: 2px; border-radius: 1px;
+    }
+    .ld-green::before  { background: var(--green);  }
+    .ld-blue::before   { background: var(--blue);   }
+    .ld-purple::before { background: var(--purple); }
+    .ld-orange::before { background: var(--orange); border-top: 2px dashed var(--orange); height: 0; }
+    .chart-wrap { height: 220px; }
 
     /* ---- event feeds ---- */
     .feeds {
@@ -475,6 +547,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       margin-top: 4px; display: block;
     }
 
+    @media (max-width: 1100px) {
+      .charts-row { grid-template-columns: 1fr; }
+    }
     @media (max-width: 900px) {
       .stats-row { grid-template-columns: 1fr 1fr; }
       .feeds { grid-template-columns: 1fr; }
@@ -513,12 +588,43 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 </div>
 
-<!-- Timeline -->
-<div class="chart-section">
-  <div class="section-title">Трафик за последние 30 минут</div>
-  <div class="chart-wrap">
-    <canvas id="timeline-chart"></canvas>
+<!-- Charts row -->
+<div class="charts-row">
+
+  <!-- Traffic volume -->
+  <div class="chart-section">
+    <div class="section-title">
+      Трафик за последние 30 минут
+      <span class="legend">
+        <span class="legend-dot ld-green">Пропущено</span>
+        <span class="legend-dot ld-purple">ML заблок.</span>
+        <span class="legend-dot ld-orange">WAF заблок.</span>
+      </span>
+    </div>
+    <div class="chart-wrap">
+      <canvas id="timeline-chart"></canvas>
+    </div>
   </div>
+
+  <!-- Quality metrics over time -->
+  <div class="chart-section">
+    <div class="section-title">
+      Точность модели за последние 30 минут
+      <span class="legend">
+        <span class="legend-dot ld-green">Detection Rate</span>
+        <span class="legend-dot ld-blue">Precision</span>
+        <span class="legend-dot ld-purple">F1 Score</span>
+        <span class="legend-dot ld-orange">FPR (ниже = лучше)</span>
+      </span>
+    </div>
+    <div class="chart-wrap">
+      <canvas id="quality-chart"></canvas>
+    </div>
+    <div id="quality-chart-nodata" style="display:none;text-align:center;padding:20px;color:var(--muted);font-size:13px;">
+      Ожидание данных с меткой <code style="background:rgba(255,255,255,.06);padding:2px 6px;border-radius:4px;color:var(--blue)">is_malicious</code>…
+    </div>
+  </div>
+
 </div>
 
 <!-- Model quality -->
@@ -632,27 +738,80 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 
 <script>
 // ---- Chart setup ----
-const ctx = document.getElementById('timeline-chart').getContext('2d');
-const chart = new Chart(ctx, {
+const GRID_COLOR = 'rgba(48,54,61,.5)';
+const TICK_COLOR = '#8b949e';
+
+const chart = new Chart(
+  document.getElementById('timeline-chart').getContext('2d'), {
   type: 'bar',
   data: {
     labels: [],
     datasets: [
-      { label: 'Пропущено',       data: [], backgroundColor: 'rgba(63,185,80,.7)',   stack: 'a' },
-      { label: 'ML заблок.',      data: [], backgroundColor: 'rgba(188,140,255,.7)', stack: 'a' },
-      { label: 'WAF заблок.',     data: [], backgroundColor: 'rgba(248,81,73,.7)',   stack: 'a' },
+      { label: 'Пропущено',   data: [], backgroundColor: 'rgba(63,185,80,.7)',   stack: 'a' },
+      { label: 'ML заблок.',  data: [], backgroundColor: 'rgba(188,140,255,.7)', stack: 'a' },
+      { label: 'WAF заблок.', data: [], backgroundColor: 'rgba(248,81,73,.7)',   stack: 'a' },
     ]
   },
   options: {
-    responsive: true,
-    maintainAspectRatio: false,
-    animation: false,
+    responsive: true, maintainAspectRatio: false, animation: false,
+    plugins: { legend: { display: false } },
+    scales: {
+      x: { stacked: true, ticks: { color: TICK_COLOR, maxTicksLimit: 12 }, grid: { color: GRID_COLOR } },
+      y: { stacked: true, ticks: { color: TICK_COLOR }, grid: { color: GRID_COLOR } }
+    }
+  }
+});
+
+const qualityChart = new Chart(
+  document.getElementById('quality-chart').getContext('2d'), {
+  type: 'line',
+  data: {
+    labels: [],
+    datasets: [
+      {
+        label: 'Detection Rate',
+        data: [], borderColor: '#3fb950', backgroundColor: 'rgba(63,185,80,.08)',
+        borderWidth: 2, pointRadius: 3, pointHoverRadius: 5,
+        fill: false, tension: 0.3, spanGaps: true,
+      },
+      {
+        label: 'Precision',
+        data: [], borderColor: '#58a6ff', backgroundColor: 'transparent',
+        borderWidth: 2, pointRadius: 3, pointHoverRadius: 5,
+        fill: false, tension: 0.3, spanGaps: true,
+      },
+      {
+        label: 'F1 Score',
+        data: [], borderColor: '#bc8cff', backgroundColor: 'transparent',
+        borderWidth: 2, pointRadius: 3, pointHoverRadius: 5,
+        fill: false, tension: 0.3, spanGaps: true,
+      },
+      {
+        label: 'FPR (ниже = лучше)',
+        data: [], borderColor: '#d29922', backgroundColor: 'transparent',
+        borderWidth: 2, borderDash: [5, 4],
+        pointRadius: 2, pointHoverRadius: 4,
+        fill: false, tension: 0.3, spanGaps: true,
+      },
+    ]
+  },
+  options: {
+    responsive: true, maintainAspectRatio: false, animation: false,
     plugins: {
-      legend: { labels: { color: '#8b949e', boxWidth: 12, font: { size: 12 } } }
+      legend: { display: false },
+      tooltip: {
+        callbacks: {
+          label: ctx => ctx.dataset.label + ': ' + (ctx.parsed.y !== null ? ctx.parsed.y + ' %' : '—')
+        }
+      }
     },
     scales: {
-      x: { stacked: true, ticks: { color: '#8b949e', maxTicksLimit: 15 }, grid: { color: 'rgba(48,54,61,.5)' } },
-      y: { stacked: true, ticks: { color: '#8b949e' },                    grid: { color: 'rgba(48,54,61,.5)' } }
+      x: { ticks: { color: TICK_COLOR, maxTicksLimit: 12 }, grid: { color: GRID_COLOR } },
+      y: {
+        min: 0, max: 100,
+        ticks: { color: TICK_COLOR, callback: v => v + '%' },
+        grid: { color: GRID_COLOR }
+      }
     }
   }
 });
@@ -712,11 +871,34 @@ async function updateStats() {
 async function updateTimeline() {
   try {
     const d = await fetch('/api/timeline').then(r => r.json());
-    chart.data.labels              = d.labels;
-    chart.data.datasets[0].data   = d.passed;
-    chart.data.datasets[1].data   = d.ml_blocked;
-    chart.data.datasets[2].data   = d.waf_blocked;
+    chart.data.labels            = d.labels;
+    chart.data.datasets[0].data  = d.passed;
+    chart.data.datasets[1].data  = d.ml_blocked;
+    chart.data.datasets[2].data  = d.waf_blocked;
     chart.update('none');
+  } catch(e) { console.error(e); }
+}
+
+async function updateQualityTimeline() {
+  try {
+    const d = await fetch('/api/quality-timeline').then(r => r.json());
+    const nodata = document.getElementById('quality-chart-nodata');
+    const canvas = document.getElementById('quality-chart');
+
+    if (!d.has_data) {
+      nodata.style.display = 'block';
+      canvas.style.display = 'none';
+      return;
+    }
+    nodata.style.display = 'none';
+    canvas.style.display = 'block';
+
+    qualityChart.data.labels           = d.labels;
+    qualityChart.data.datasets[0].data = d.dr;
+    qualityChart.data.datasets[1].data = d.precision;
+    qualityChart.data.datasets[2].data = d.f1;
+    qualityChart.data.datasets[3].data = d.fpr;
+    qualityChart.update('none');
   } catch(e) { console.error(e); }
 }
 
@@ -809,13 +991,15 @@ function tick() {
   updateWAFEvents();
 }
 
-setInterval(updateTimeline,     5000);
-setInterval(updateModelQuality, 8000);
+setInterval(updateTimeline,        5000);
+setInterval(updateQualityTimeline, 5000);
+setInterval(updateModelQuality,    8000);
 setInterval(tick, 2000);
 
 // initial load
 tick();
 updateTimeline();
+updateQualityTimeline();
 updateModelQuality();
 </script>
 

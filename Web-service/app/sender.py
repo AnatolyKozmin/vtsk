@@ -12,7 +12,7 @@ import httpx
 import orjson
 
 from app.database import get_db, init_db
-from app.models import TestSession
+from app.models import TestSession, TrafficRequest
 from app.config import get_settings
 from app.attacks.generator import TrafficConfig, TrafficMode, get_traffic_generator, generate_batch_id
 from app.attacks.patterns import AttackCategory
@@ -85,7 +85,30 @@ async def run_test_session(session_id: str, config: TrafficConfig, db: AsyncSess
     
     batch_id = generate_batch_id()
     sent_count = 0
-    
+    pending_requests: list[TrafficRequest] = []
+
+    async def flush_requests():
+        if not pending_requests:
+            return
+        for obj in pending_requests:
+            db.add(obj)
+        await db.commit()
+        pending_requests.clear()
+
+    def track(req_data: dict) -> None:
+        """Записывает отправляемый запрос в traffic_requests для метрик качества модели."""
+        from datetime import datetime, timezone
+        pending_requests.append(TrafficRequest(
+            request_id=req_data["request_id"],
+            batch_id=batch_id,
+            attack_type=req_data.get("attack_type", "normal"),
+            payload_size=req_data.get("payload_size", 0),
+            sent_at=datetime.now(timezone.utc).replace(tzinfo=None),
+            http_method="POST",
+            is_malicious=bool(req_data.get("is_malicious", False)),
+            malicious_pattern=req_data.get("malicious_pattern") or None,
+        ))
+
     async with httpx.AsyncClient() as client:
         if config.mode == TrafficMode.FLOOD:
             semaphore = asyncio.Semaphore(settings.max_workers)
@@ -96,22 +119,28 @@ async def run_test_session(session_id: str, config: TrafficConfig, db: AsyncSess
             
             tasks = []
             async for request_data in get_traffic_generator(config, batch_id):
+                track(request_data)
                 tasks.append(send_with_semaphore(request_data))
                 sent_count += 1
                 if len(tasks) >= 100:
                     await asyncio.gather(*tasks)
                     tasks = []
+                    await flush_requests()
             if tasks:
                 await asyncio.gather(*tasks)
+            await flush_requests()
         else:
             async for request_data in get_traffic_generator(config, batch_id):
+                track(request_data)
                 await send_request(client, request_data, session_id, metrics)
                 sent_count += 1
                 if sent_count % 100 == 0:
                     active_sessions[session_id]["sent_count"] = sent_count
+                    await flush_requests()
     
+    await flush_requests()
     summary = metrics.get_summary()
-    
+
     result = await db.execute(select(TestSession).where(TestSession.session_id == session_id))
     session = result.scalar_one_or_none()
     if session:
